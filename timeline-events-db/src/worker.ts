@@ -117,8 +117,10 @@ export default {
           if (expected && token !== expected) {
             return new Response("unauthorized", { status: 401 });
           }
-          const summary = await syncFromFacebookToD1(env);
-          return jsonResponse({ status: "ok", ...summary });
+          // Use waitUntil to allow the sync to complete in the background
+          // after we've already responded to the webhook.
+          ctx.waitUntil(syncFromFacebookToD1(env));
+          return jsonResponse({ status: "ok", message: "sync triggered" });
         }
       }
 
@@ -249,10 +251,18 @@ async function servePhoto(storageKey: string, env: Env): Promise<Response> {
   });
 }
 
+type SyncSummary = {
+  eventsProcessed: number;
+  inserted: number;
+  updated: number;
+  nextCursor?: string;
+  hasMore?: boolean;
+};
+
 async function syncFromFacebookToD1(
   env: Env,
   opts?: { limit?: number; maxTotal?: number; cursor?: string; maxPages?: number }
-): Promise<{ eventsProcessed: number; nextCursor?: string; hasMore?: boolean }> {
+): Promise<SyncSummary> {
   const authorProfile = await fetchAuthorProfile(env).catch((err) => {
     console.error("failed to fetch author profile", err);
     return null;
@@ -260,12 +270,15 @@ async function syncFromFacebookToD1(
 
   let cursor: string | undefined = opts?.cursor;
   const limit = opts?.limit;
-  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? opts.maxTotal : 100;
-  const maxPages = opts?.maxPages;
+  // Keep default pulls small to avoid subrequest limits (R2 uploads add subrequests).
+  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? opts.maxTotal : 40;
+  const maxPages = opts?.maxPages && opts.maxPages > 0 ? opts.maxPages : 5;
 
   let processed = 0;
   let iterations = 0;
   let lastCursor: string | undefined;
+  let inserted = 0;
+  let updated = 0;
 
   while (processed < maxTotal && iterations < 20) {
     const remaining = maxTotal - processed;
@@ -279,9 +292,11 @@ async function syncFromFacebookToD1(
     for (const post of posts) {
       try {
         const isLifeEvent = hasLifeEventAttachment(post) || post.status_type === "life_event";
-        const didUpsert = await upsertFacebookPost(env, post, authorProfile, isLifeEvent);
-        if (didUpsert) {
+        const result = await upsertFacebookPost(env, post, authorProfile, isLifeEvent);
+        if (result.processed) {
           processed += 1;
+          if (result.inserted) inserted += 1;
+          if (result.updated) updated += 1;
         }
       } catch (err) {
         console.error("failed to process post", post.id, err);
@@ -299,7 +314,7 @@ async function syncFromFacebookToD1(
   }
 
   const hasMore = Boolean(lastCursor && processed < maxTotal);
-  return { eventsProcessed: processed, nextCursor: lastCursor, hasMore };
+  return { eventsProcessed: processed, inserted, updated, nextCursor: lastCursor, hasMore };
 }
 
 async function upsertFacebookPost(
@@ -307,10 +322,12 @@ async function upsertFacebookPost(
   post: FacebookPost,
   authorProfile: AuthorProfile | null,
   isLifeEvent: boolean
-): Promise<boolean> {
+): Promise<{ processed: boolean; inserted: boolean; updated: boolean }> {
   if (!post.id) {
-    return false;
+    return { processed: false, inserted: false, updated: false };
   }
+
+  const returnFlag = { processed: true, inserted: false, updated: false };
 
   const rawMessage = (post.message || "").trim();
   const mainAttachment = getPrimaryAttachment(post.attachments);
@@ -336,9 +353,9 @@ async function upsertFacebookPost(
   const authorPhoto = authorProfile?.photo || null;
 
   const existing = await env.EVENTS_DB.prepare(
-    "SELECT id FROM events WHERE external_source = ? AND external_id = ?"
+    "SELECT id FROM events WHERE external_id = ? AND origin = 'facebook'"
   )
-    .bind("facebook_post", post.id)
+    .bind(post.id)
     .first<{ id: number }>();
 
   const now = new Date().toISOString();
@@ -354,7 +371,7 @@ async function upsertFacebookPost(
     )
       .bind(
         structured.eventDate || post.created_time || now,
-        structured.eventType || "memory",
+        structured.eventType || post.status_type || (isLifeEvent ? "life_event" : "memory"),
         line1,
         line2,
         fullText || null,
@@ -365,12 +382,7 @@ async function upsertFacebookPost(
       )
       .run();
     eventId = existing.id;
-
-    if (isLifeEvent) {
-      await env.EVENTS_DB.prepare("UPDATE events SET sync = 1 WHERE id = ?")
-        .bind(existing.id)
-        .run();
-    }
+    returnFlag.updated = true;
   } else {
     const { lastInsertRowid } = await env.EVENTS_DB.prepare(
       `INSERT INTO events (
@@ -383,7 +395,7 @@ async function upsertFacebookPost(
         post.id,
         "facebook_post",
         structured.eventDate || post.created_time || now,
-        structured.eventType || post.status_type || "memory",
+        structured.eventType || post.status_type || (isLifeEvent ? "life_event" : "memory"),
         line1,
         line2,
         fullText || null,
@@ -393,12 +405,13 @@ async function upsertFacebookPost(
         1,
         0,
         "facebook",
-        isLifeEvent ? 1 : 0,
+        1,
         now,
         now
       )
       .run();
     eventId = Number(lastInsertRowid);
+    returnFlag.inserted = true;
   }
 
   // Refresh photos for this event without duplicating R2 objects.
@@ -449,7 +462,7 @@ async function upsertFacebookPost(
     }
   }
 
-  return true;
+  return returnFlag;
 }
 
 function splitMessage(message: string): { line1: string; line2: string | null } {
@@ -653,14 +666,13 @@ async function fetchFacebookFeed(
   opts?: { limit?: number; maxTotal?: number; cursor?: string; maxPages?: number }
 ): Promise<{ posts: FacebookPost[]; nextCursor?: string }> {
   const limit = opts?.limit && opts.limit > 0 ? Math.min(opts.limit, 100) : 25;
-  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? Math.min(opts.maxTotal, 500) : limit;
-  const maxPages = opts?.maxPages && opts.maxPages > 0 ? Math.min(opts.maxPages, 40) : 10; // stay under subrequest limits
+  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? Math.min(opts.maxTotal, 500) : 100;
 
   let after: string | null = opts?.cursor || null;
   const results: FacebookPost[] = [];
   let pageCount = 0;
   let nextCursor: string | undefined;
-
+  const maxPages = 40; // Hard safety limit to prevent infinite loops
   const baseFields = [
     "message",
     "story",
@@ -796,12 +808,14 @@ async function cleanDuplicates(env: Env): Promise<{
     const grouped = new Map<number, Map<string, EventPhotoRecord[]>>();
 
     for (const p of allPhotos) {
-      const norm = p.original_source_url ? normalizeSourceUrl(p.original_source_url) : "";
-      const byEvent = grouped.get(p.event_id) || new Map<string, EventPhotoRecord[]>();
-      const arr = byEvent.get(norm) || [];
-      arr.push(p);
-      byEvent.set(norm, arr);
-      grouped.set(p.event_id, byEvent);
+      if (p.original_source_url) {
+        const norm = normalizeSourceUrl(p.original_source_url);
+        const byEvent = grouped.get(p.event_id) || new Map<string, EventPhotoRecord[]>();
+        const arr = byEvent.get(norm) || [];
+        arr.push(p);
+        byEvent.set(norm, arr);
+        grouped.set(p.event_id, byEvent);
+      }
     }
 
     for (const [, byNorm] of grouped) {
