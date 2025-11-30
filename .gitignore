@@ -1,0 +1,44 @@
+# Node / JS tooling
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Build outputs
+dist/
+build/
+.wrangler/
+.parcel-cache/
+.cache/
+.next/
+out/
+
+# Environment / secrets
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+.wrangler*log*
+.npmrc
+.DS_Store
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+*.sws
+
+# Generated artifacts
+*.tar
+*.tgz
+*.zip
+
+# Mac / system
+Thumbs.db
+ehthumbs.db

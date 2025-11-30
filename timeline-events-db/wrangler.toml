@@ -1,0 +1,25 @@
+name = "timeline-events-worker"
+main = "src/worker.ts"
+compatibility_date = "2025-11-29"
+
+
+[[d1_databases]]
+binding = "EVENTS_DB"
+database_name = "timeline-events"
+database_id = "cff735c4-b641-4179-a4e1-11a1dc269977"
+
+[[r2_buckets]]
+binding = "EVENT_PHOTOS_BUCKET"
+bucket_name = "timeline-events-photos"
+preview_bucket_name  = "timeline-events-photos"
+
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+[vars]
+PUBLIC_BASE_URL = "https://4c154709ffe87621073f9ecfa86a57dd.r2.cloudflarestorage.com/timeline-events-photos"
+DEV_BASE_URL = "https://4c154709ffe87621073f9ecfa86a57dd.r2.cloudflarestorage.com/dev-timeline-events-photos"
+WEBHOOK_SECRET = "memorysync"
+
+
