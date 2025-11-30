@@ -283,9 +283,11 @@ async function syncFromFacebookToD1(
   // Keep default pulls small to avoid subrequest limits (R2 uploads add subrequests).
   const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? opts.maxTotal : 10;
 
-  console.log(
-    `[Facebook Sync] Starting batch. Chain=${opts?.shouldChain}, MaxTotal=${maxTotal}, ${cursor ? `Cursor: ${cursor.substring(0, 30)}...` : "No cursor (first batch)"}`
-  );
+  if (opts?.shouldChain) {
+    console.log(
+      `Starting Facebook sync batch. Goal: ${maxTotal} posts with content. ${cursor ? `Cursor: ${cursor.substring(0, 20)}...` : "Starting from beginning."}`
+    );
+  }
 
   let processed = 0;
   let iterations = 0;
@@ -347,10 +349,6 @@ async function syncFromFacebookToD1(
   const hasMore = processed >= maxTotal && Boolean(lastCursor);
   const summary = { eventsProcessed: processed, inserted, updated, nextCursor: lastCursor, hasMore };
 
-  console.log(
-    `[Facebook Sync] Batch results: Processed=${processed}/${maxTotal}, Inserted=${inserted}, Updated=${updated}, Iterations=${iterations}, HasMore=${hasMore}`
-  );
-
   // If there's more data and chaining is enabled, trigger the next batch.
   if (hasMore && opts?.shouldChain && lastCursor) {
     console.log(
@@ -363,26 +361,8 @@ async function syncFromFacebookToD1(
     nextUrl.searchParams.set("cursor", lastCursor);
     if (requestUrl.searchParams.has("token")) nextUrl.searchParams.set("token", requestUrl.searchParams.get("token")!);
 
-    console.log(`Triggering next batch with URL: ${nextUrl.toString().substring(0, 150)}...`);
-
     // Use waitUntil to fire-and-forget the next chained request.
-    ctx.waitUntil(
-      fetch(nextUrl.toString(), { method: "POST" })
-        .then((res) => {
-          console.log(`Chained request completed with status: ${res.status}`);
-          return res.text();
-        })
-        .then((text) => {
-          console.log(`Chained request response: ${text.substring(0, 200)}`);
-        })
-        .catch((err) => {
-          console.error(`Chained request failed:`, err);
-        })
-    );
-  } else {
-    console.log(
-      `Sync complete. No chaining: hasMore=${hasMore}, shouldChain=${opts?.shouldChain}, hasCursor=${Boolean(lastCursor)}`
-    );
+    ctx.waitUntil(fetch(nextUrl.toString(), { method: "POST" }));
   }
 
   return summary;
