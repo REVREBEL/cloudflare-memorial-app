@@ -271,8 +271,7 @@ async function syncFromFacebookToD1(
   let cursor: string | undefined = opts?.cursor;
   const limit = opts?.limit;
   // Keep default pulls small to avoid subrequest limits (R2 uploads add subrequests).
-  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? opts.maxTotal : 40;
-  const maxPages = opts?.maxPages && opts.maxPages > 0 ? opts.maxPages : 5;
+  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? opts.maxTotal : 500;
 
   let processed = 0;
   let iterations = 0;
@@ -286,7 +285,6 @@ async function syncFromFacebookToD1(
       limit,
       maxTotal: remaining,
       cursor,
-      maxPages,
     });
 
     for (const post of posts) {
@@ -666,13 +664,13 @@ async function fetchFacebookFeed(
   opts?: { limit?: number; maxTotal?: number; cursor?: string; maxPages?: number }
 ): Promise<{ posts: FacebookPost[]; nextCursor?: string }> {
   const limit = opts?.limit && opts.limit > 0 ? Math.min(opts.limit, 100) : 25;
-  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? Math.min(opts.maxTotal, 500) : 100;
+  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? Math.min(opts.maxTotal, 500) : 500;
 
   let after: string | null = opts?.cursor || null;
   const results: FacebookPost[] = [];
   let pageCount = 0;
   let nextCursor: string | undefined;
-  const maxPages = 40; // Hard safety limit to prevent infinite loops
+  const maxPages = 40; // Hard safety limit to prevent accidental infinite loops
   const baseFields = [
     "message",
     "story",
