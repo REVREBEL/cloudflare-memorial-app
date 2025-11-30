@@ -92,20 +92,34 @@ export default {
       }
 
       if (request.method === "POST" && url.pathname === "/api/sync/facebook") {
-        const summary = await syncFromFacebookToD1(env);
+        const maxTotal = Number(url.searchParams.get("max")) || undefined;
+        const limit = Number(url.searchParams.get("limit")) || undefined;
+        const cursor = url.searchParams.get("cursor") || undefined;
+        const maxPages = Number(url.searchParams.get("pages")) || undefined;
+        const summary = await syncFromFacebookToD1(env, { maxTotal, limit, cursor, maxPages });
         return jsonResponse({ status: "ok", ...summary });
       }
 
-      // Lightweight webhook endpoint for Facebook App callbacks to trigger a sync.
-      // Optionally include a shared secret query param ?token=... and compare to env.WEBHOOK_SECRET if set.
-      if (request.method === "POST" && url.pathname === "/api/webhook/facebook") {
+      // Facebook webhook verification (GET) and trigger (POST)
+      if (url.pathname === "/api/webhook/facebook") {
         const expected = env.WEBHOOK_SECRET;
-        const token = url.searchParams.get("token");
-        if (expected && token !== expected) {
+        if (request.method === "GET") {
+          const mode = url.searchParams.get("hub.mode");
+          const token = url.searchParams.get("hub.verify_token");
+          const challenge = url.searchParams.get("hub.challenge");
+          if (mode === "subscribe" && expected && token === expected && challenge) {
+            return new Response(challenge, { status: 200 });
+          }
           return new Response("unauthorized", { status: 401 });
         }
-        const summary = await syncFromFacebookToD1(env);
-        return jsonResponse({ status: "ok", ...summary });
+        if (request.method === "POST") {
+          const token = url.searchParams.get("token") || url.searchParams.get("verify_token");
+          if (expected && token !== expected) {
+            return new Response("unauthorized", { status: 401 });
+          }
+          const summary = await syncFromFacebookToD1(env);
+          return jsonResponse({ status: "ok", ...summary });
+        }
       }
 
       if (request.method === "POST" && url.pathname === "/api/sync/webflow") {
@@ -229,43 +243,16 @@ async function servePhoto(storageKey: string, env: Env): Promise<Response> {
   });
 }
 
-async function syncFromFacebookToD1(env: Env): Promise<{ eventsProcessed: number }> {
+async function syncFromFacebookToD1(
+  env: Env,
+  opts?: { limit?: number; maxTotal?: number; cursor?: string; maxPages?: number }
+): Promise<{ eventsProcessed: number; nextCursor?: string; hasMore?: boolean }> {
   const authorProfile = await fetchAuthorProfile(env).catch((err) => {
     console.error("failed to fetch author profile", err);
     return null;
   });
 
-  const api = new URL(`https://graph.facebook.com/v24.0/${env.FB_PAGE_ID}/feed`);
-  api.searchParams.set(
-    "fields",
-    [
-      "message",
-      "story",
-      "full_picture",
-      "created_time",
-      "backdated_time",
-      "from{id,name}",
-      "to{name,id,username}",
-      "status_type",
-      "event",
-      "place{name}",
-      "properties",
-      "story_tags",
-      "permalink_url",
-      "attachments{description,title,type,description_tags,media_type,media{image{src},source},subattachments{description,title,type,media{image{src},source}}}",
-    ].join(",")
-  );
-  api.searchParams.set("access_token", env.FB_PAGE_ACCESS_TOKEN);
-  api.searchParams.set("limit", "25");
-
-  const res = await fetch(api.toString());
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Facebook API error ${res.status}: ${text}`);
-  }
-
-  const json = (await res.json()) as { data?: FacebookPost[] };
-  const posts = json.data || [];
+  const { posts, nextCursor } = await fetchFacebookFeed(env, opts);
   let processed = 0;
 
   for (const post of posts) {
@@ -274,19 +261,21 @@ async function syncFromFacebookToD1(env: Env): Promise<{ eventsProcessed: number
       if (!isLifeEvent) {
         continue; // only ingest life events for the memorial timeline
       }
-      await upsertFacebookPost(env, post, authorProfile);
-      processed += 1;
+      const didUpsert = await upsertFacebookPost(env, post, authorProfile);
+      if (didUpsert) {
+        processed += 1;
+      }
     } catch (err) {
       console.error("failed to process post", post.id, err);
     }
   }
 
-  return { eventsProcessed: processed };
+  return { eventsProcessed: processed, nextCursor, hasMore: Boolean(nextCursor) };
 }
 
-async function upsertFacebookPost(env: Env, post: FacebookPost, authorProfile: AuthorProfile | null): Promise<void> {
+async function upsertFacebookPost(env: Env, post: FacebookPost, authorProfile: AuthorProfile | null): Promise<boolean> {
   if (!post.id) {
-    return;
+    return false;
   }
 
   const rawMessage = (post.message || "").trim();
@@ -372,23 +361,54 @@ async function upsertFacebookPost(env: Env, post: FacebookPost, authorProfile: A
     eventId = Number(lastInsertRowid);
   }
 
-  // Refresh photos for this event each sync to avoid duplicates.
-  await env.EVENTS_DB.prepare("DELETE FROM event_photos WHERE event_id = ?")
+  // Refresh photos for this event without duplicating R2 objects.
+  const { results: existingPhotos } = await env.EVENTS_DB.prepare(
+    "SELECT * FROM event_photos WHERE event_id = ?"
+  )
     .bind(eventId)
-    .run();
+    .all<EventPhotoRecord>();
+  const existingBySource = new Map<string, EventPhotoRecord>();
+  (existingPhotos || []).forEach((p) => {
+    if (p.original_source_url) existingBySource.set(p.original_source_url, p);
+  });
 
   const photoUrls = extractPhotoUrls(post.attachments);
   if (!photoUrls.length && post.full_picture) {
     photoUrls.push(post.full_picture);
   }
   let position = 0;
+  const seenSources = new Set<string>();
+
   for (const url of photoUrls) {
+    if (!url) continue;
+    seenSources.add(url);
+    const existingPhoto = existingBySource.get(url);
+    if (existingPhoto) {
+      await env.EVENTS_DB.prepare(
+        "UPDATE event_photos SET position = ?, updated_at = ? WHERE id = ?"
+      )
+        .bind(position++, new Date().toISOString(), existingPhoto.id)
+        .run();
+      continue;
+    }
+
     try {
       await persistPhotoFromUrl(env, eventId, url, position++);
     } catch (err) {
       console.error("failed to persist photo", url, err);
     }
   }
+
+  // Remove orphaned rows whose source URLs are no longer present.
+  for (const p of existingPhotos || []) {
+    if (p.original_source_url && !seenSources.has(p.original_source_url)) {
+      await env.EVENTS_DB.prepare("DELETE FROM event_photos WHERE id = ?")
+        .bind(p.id)
+        .run();
+    }
+  }
+
+  return true;
 }
 
 function splitMessage(message: string): { line1: string; line2: string | null } {
@@ -574,6 +594,64 @@ async function fetchWebflowFieldMap(env: Env): Promise<Record<string, string>> {
     map[def.slug] = def.id;
   });
   return map;
+}
+
+async function fetchFacebookFeed(
+  env: Env,
+  opts?: { limit?: number; maxTotal?: number; cursor?: string; maxPages?: number }
+): Promise<{ posts: FacebookPost[]; nextCursor?: string }> {
+  const limit = opts?.limit && opts.limit > 0 ? Math.min(opts.limit, 100) : 25;
+  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? Math.min(opts.maxTotal, 500) : limit;
+  const maxPages = opts?.maxPages && opts.maxPages > 0 ? Math.min(opts.maxPages, 40) : 10; // stay under subrequest limits
+
+  let after: string | null = opts?.cursor || null;
+  const results: FacebookPost[] = [];
+  let pageCount = 0;
+  let nextCursor: string | undefined;
+
+  const baseFields = [
+    "message",
+    "story",
+    "full_picture",
+    "created_time",
+    "backdated_time",
+    "from{id,name}",
+    "to{name,id,username}",
+    "status_type",
+    "event",
+    "place{name}",
+    "properties",
+    "story_tags",
+    "permalink_url",
+    "attachments{description,title,type,description_tags,media_type,media{image{src},source},subattachments{description,title,type,media{image{src},source}}}",
+  ].join(",");
+
+  while (results.length < maxTotal && pageCount < maxPages) {
+    const api = new URL(`https://graph.facebook.com/v24.0/${env.FB_PAGE_ID}/feed`);
+    api.searchParams.set("fields", baseFields);
+    api.searchParams.set("access_token", env.FB_PAGE_ACCESS_TOKEN);
+    api.searchParams.set("limit", String(limit));
+    if (after) api.searchParams.set("after", after);
+
+    const res = await fetch(api.toString());
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Facebook API error ${res.status}: ${text}`);
+    }
+
+    const json = (await res.json()) as { data?: FacebookPost[]; paging?: { cursors?: { after?: string } } };
+    const batch = json.data || [];
+    results.push(...batch);
+
+    if (!json.paging?.cursors?.after || batch.length === 0) {
+      break;
+    }
+    after = json.paging.cursors.after;
+    nextCursor = after;
+    pageCount += 1;
+  }
+
+  return { posts: results.slice(0, maxTotal), nextCursor };
 }
 
 async function persistPhotoFromUrl(
