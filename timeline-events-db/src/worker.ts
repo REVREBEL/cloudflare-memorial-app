@@ -1,3 +1,10 @@
+import type {
+  D1Database,
+  ExecutionContext,
+  R2Bucket,
+  ScheduledEvent,
+  Request,
+} from "@cloudflare/workers-types";
 export interface Env {
   EVENTS_DB: D1Database;
   EVENT_PHOTOS_BUCKET: R2Bucket;
@@ -95,8 +102,8 @@ export default {
         const maxTotal = Number(url.searchParams.get("max")) || undefined;
         const limit = Number(url.searchParams.get("limit")) || undefined;
         const cursor = url.searchParams.get("cursor") || undefined;
-        const maxPages = Number(url.searchParams.get("pages")) || undefined;
-        const summary = await syncFromFacebookToD1(env, { maxTotal, limit, cursor, maxPages });
+        const shouldChain = url.searchParams.get("chain") === "true";
+        const summary = await syncFromFacebookToD1(env, ctx, url, { maxTotal, limit, cursor, shouldChain });
         return jsonResponse({ status: "ok", ...summary });
       }
 
@@ -117,9 +124,9 @@ export default {
           if (expected && token !== expected) {
             return new Response("unauthorized", { status: 401 });
           }
-          // Use waitUntil to allow the sync to complete in the background
+          // Use waitUntil to allow the sync (and any chained calls) to complete in the background
           // after we've already responded to the webhook.
-          ctx.waitUntil(syncFromFacebookToD1(env));
+          ctx.waitUntil(syncFromFacebookToD1(env, ctx, url, { shouldChain: true }));
           return jsonResponse({ status: "ok", message: "sync triggered" });
         }
       }
@@ -143,7 +150,7 @@ export default {
 
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
     await cleanDuplicates(env);
-    await syncFromFacebookToD1(env);
+    await syncFromFacebookToD1(env, _ctx, new URL("https://scheduled.run"), { shouldChain: true });
     await syncFromD1ToWebflow(env);
     // Future:
     // await syncFromD1ToFacebook(env);
@@ -195,7 +202,7 @@ async function createEvent(request: Request, env: Env): Promise<Response> {
   const origin = body.origin === "facebook" ? "facebook" : "webflow";
   const sync = typeof body.sync === "number" ? body.sync : 1;
 
-  const { lastInsertRowid } = await env.EVENTS_DB.prepare(
+  const result = await env.EVENTS_DB.prepare(
     `INSERT INTO events (
       external_id, external_source, event_date, event_type, event_name_line_1,
       event_name_line_2, event_description, posted_by_name, posted_by_photo,
@@ -222,7 +229,7 @@ async function createEvent(request: Request, env: Env): Promise<Response> {
     )
     .run();
 
-  const eventId = Number(lastInsertRowid);
+  const eventId = result.meta.last_row_id;
   if (body.photos && body.photos.length) {
     let position = 0;
     for (const src of body.photos) {
@@ -243,7 +250,7 @@ async function servePhoto(storageKey: string, env: Env): Promise<Response> {
     return new Response("Not found", { status: 404 });
   }
 
-  return new Response(obj.body, {
+  return new Response(obj.body as ReadableStream, {
     headers: {
       "Content-Type": obj.httpMetadata?.contentType || "image/jpeg",
       "Cache-Control": "public, max-age=31536000, immutable",
@@ -261,7 +268,9 @@ type SyncSummary = {
 
 async function syncFromFacebookToD1(
   env: Env,
-  opts?: { limit?: number; maxTotal?: number; cursor?: string; maxPages?: number }
+  ctx: ExecutionContext,
+  requestUrl: URL,
+  opts?: { limit?: number; maxTotal?: number; cursor?: string; shouldChain?: boolean }
 ): Promise<SyncSummary> {
   const authorProfile = await fetchAuthorProfile(env).catch((err) => {
     console.error("failed to fetch author profile", err);
@@ -269,9 +278,16 @@ async function syncFromFacebookToD1(
   });
 
   let cursor: string | undefined = opts?.cursor;
-  const limit = opts?.limit;
+  // Fetch more posts per API call to account for filtered posts
+  const limit = opts?.limit || 25;
   // Keep default pulls small to avoid subrequest limits (R2 uploads add subrequests).
   const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? opts.maxTotal : 10;
+
+  if (opts?.shouldChain) {
+    console.log(
+      `Starting Facebook sync batch. Goal: ${maxTotal} posts with content. ${cursor ? `Cursor: ${cursor.substring(0, 20)}...` : "Starting from beginning."}`
+    );
+  }
 
   let processed = 0;
   let iterations = 0;
@@ -279,15 +295,29 @@ async function syncFromFacebookToD1(
   let inserted = 0;
   let updated = 0;
 
+  // Continue fetching until we've processed enough posts WITH content, not just any posts
   while (processed < maxTotal && iterations < 20) {
-    const remaining = maxTotal - processed;
     const { posts, nextCursor } = await fetchFacebookFeed(env, {
       limit,
-      maxTotal: remaining,
       cursor,
     });
 
+    if (posts.length === 0) {
+      break;
+    }
+
     for (const post of posts) {
+      // Only process items that are actual posts (have a message or story).
+      // This filters out noise like likes, comments, etc. from the feed.
+      if (!post.message && !post.story) {
+        continue;
+      }
+
+      // Stop if we've hit our goal
+      if (processed >= maxTotal) {
+        break;
+      }
+
       try {
         const isLifeEvent = hasLifeEventAttachment(post) || post.status_type === "life_event";
         const result = await upsertFacebookPost(env, post, authorProfile, isLifeEvent);
@@ -301,18 +331,41 @@ async function syncFromFacebookToD1(
       }
     }
 
-    if (!nextCursor || posts.length === 0 || processed >= maxTotal) {
+    // Save the cursor for potential chaining
+    if (nextCursor) {
       lastCursor = nextCursor;
+    }
+
+    // If we've processed enough posts or there's no more data, stop
+    if (processed >= maxTotal || !nextCursor) {
       break;
     }
 
     cursor = nextCursor;
-    lastCursor = nextCursor;
     iterations += 1;
   }
 
-  const hasMore = Boolean(lastCursor && processed < maxTotal);
-  return { eventsProcessed: processed, inserted, updated, nextCursor: lastCursor, hasMore };
+  // Determine if Facebook has more data - only if we hit our processing limit AND have a cursor
+  const hasMore = processed >= maxTotal && Boolean(lastCursor);
+  const summary = { eventsProcessed: processed, inserted, updated, nextCursor: lastCursor, hasMore };
+
+  // If there's more data and chaining is enabled, trigger the next batch.
+  if (hasMore && opts?.shouldChain && lastCursor) {
+    console.log(
+      `Sync batch complete. Processed: ${summary.eventsProcessed}, Inserted: ${summary.inserted}, Updated: ${summary.updated}. Chaining to next batch...`
+    );
+
+    const nextUrl = new URL(requestUrl.pathname, requestUrl.origin);
+    // Preserve the 'chain' and 'token' parameters for the next request.
+    if (opts.shouldChain) nextUrl.searchParams.set("chain", "true");
+    nextUrl.searchParams.set("cursor", lastCursor);
+    if (requestUrl.searchParams.has("token")) nextUrl.searchParams.set("token", requestUrl.searchParams.get("token")!);
+
+    // Use waitUntil to fire-and-forget the next chained request.
+    ctx.waitUntil(fetch(nextUrl.toString(), { method: "POST" }));
+  }
+
+  return summary;
 }
 
 async function upsertFacebookPost(
@@ -382,7 +435,7 @@ async function upsertFacebookPost(
     eventId = existing.id;
     returnFlag.updated = true;
   } else {
-    const { lastInsertRowid } = await env.EVENTS_DB.prepare(
+    const result = await env.EVENTS_DB.prepare(
       `INSERT INTO events (
         external_id, external_source, event_date, event_type, event_name_line_1,
         event_name_line_2, event_description, posted_by_name, posted_by_photo,
@@ -408,7 +461,7 @@ async function upsertFacebookPost(
         now
       )
       .run();
-    eventId = Number(lastInsertRowid);
+    eventId = result.meta.last_row_id;
     returnFlag.inserted = true;
   }
 
@@ -661,16 +714,11 @@ function normalizeSourceUrl(url: string): string {
 
 async function fetchFacebookFeed(
   env: Env,
-  opts?: { limit?: number; maxTotal?: number; cursor?: string; maxPages?: number }
+  opts?: { limit?: number; cursor?: string }
 ): Promise<{ posts: FacebookPost[]; nextCursor?: string }> {
   const limit = opts?.limit && opts.limit > 0 ? Math.min(opts.limit, 100) : 25;
-  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? Math.min(opts.maxTotal, 100) : 10;
+  const after: string | null = opts?.cursor || null;
 
-  let after: string | null = opts?.cursor || null;
-  const results: FacebookPost[] = [];
-  let pageCount = 0;
-  let nextCursor: string | undefined;
-  const maxPages = 40; // Hard safety limit to prevent accidental infinite loops
   const baseFields = [
     "message",
     "story",
@@ -688,32 +736,23 @@ async function fetchFacebookFeed(
     "attachments{description,title,type,description_tags,media_type,media{image{src},source},subattachments{description,title,type,media{image{src},source}}}",
   ].join(",");
 
-  while (results.length < maxTotal && pageCount < maxPages) {
-    const api = new URL(`https://graph.facebook.com/v24.0/${env.FB_PAGE_ID}/feed`);
-    api.searchParams.set("fields", baseFields);
-    api.searchParams.set("access_token", env.FB_PAGE_ACCESS_TOKEN);
-    api.searchParams.set("limit", String(limit));
-    if (after) api.searchParams.set("after", after);
+  const api = new URL(`https://graph.facebook.com/v24.0/${env.FB_PAGE_ID}/feed`);
+  api.searchParams.set("fields", baseFields);
+  api.searchParams.set("access_token", env.FB_PAGE_ACCESS_TOKEN);
+  api.searchParams.set("limit", String(limit));
+  if (after) api.searchParams.set("after", after);
 
-    const res = await fetch(api.toString());
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Facebook API error ${res.status}: ${text}`);
-    }
-
-    const json = (await res.json()) as { data?: FacebookPost[]; paging?: { cursors?: { after?: string } } };
-    const batch = json.data || [];
-    results.push(...batch);
-
-    if (!json.paging?.cursors?.after || batch.length === 0) {
-      break;
-    }
-    after = json.paging.cursors.after;
-    nextCursor = after;
-    pageCount += 1;
+  const res = await fetch(api.toString());
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Facebook API error ${res.status}: ${text}`);
   }
 
-  return { posts: results.slice(0, maxTotal), nextCursor };
+  const json = (await res.json()) as { data?: FacebookPost[]; paging?: { cursors?: { after?: string } } };
+  const posts = json.data || [];
+  const nextCursor = json.paging?.cursors?.after;
+
+  return { posts, nextCursor };
 }
 
 async function cleanDuplicates(env: Env): Promise<{
