@@ -127,6 +127,11 @@ export default {
         return jsonResponse({ status: "ok", ...summary });
       }
 
+      if (request.method === "POST" && url.pathname === "/api/maintenance/dedupe") {
+        const summary = await cleanDuplicates(env);
+        return jsonResponse({ status: "ok", ...summary });
+      }
+
       return new Response("Not found", { status: 404 });
     } catch (err) {
       console.error("fetch handler error", err);
@@ -135,6 +140,7 @@ export default {
   },
 
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await cleanDuplicates(env);
     await syncFromFacebookToD1(env);
     await syncFromD1ToWebflow(env);
     // Future:
@@ -252,28 +258,56 @@ async function syncFromFacebookToD1(
     return null;
   });
 
-  const { posts, nextCursor } = await fetchFacebookFeed(env, opts);
-  let processed = 0;
+  let cursor: string | undefined = opts?.cursor;
+  const limit = opts?.limit;
+  const maxTotal = opts?.maxTotal && opts.maxTotal > 0 ? opts.maxTotal : 100;
+  const maxPages = opts?.maxPages;
 
-  for (const post of posts) {
-    try {
-      const isLifeEvent = hasLifeEventAttachment(post) || post.status_type === "life_event";
-      if (!isLifeEvent) {
-        continue; // only ingest life events for the memorial timeline
+  let processed = 0;
+  let iterations = 0;
+  let lastCursor: string | undefined;
+
+  while (processed < maxTotal && iterations < 20) {
+    const remaining = maxTotal - processed;
+    const { posts, nextCursor } = await fetchFacebookFeed(env, {
+      limit,
+      maxTotal: remaining,
+      cursor,
+      maxPages,
+    });
+
+    for (const post of posts) {
+      try {
+        const isLifeEvent = hasLifeEventAttachment(post) || post.status_type === "life_event";
+        const didUpsert = await upsertFacebookPost(env, post, authorProfile, isLifeEvent);
+        if (didUpsert) {
+          processed += 1;
+        }
+      } catch (err) {
+        console.error("failed to process post", post.id, err);
       }
-      const didUpsert = await upsertFacebookPost(env, post, authorProfile);
-      if (didUpsert) {
-        processed += 1;
-      }
-    } catch (err) {
-      console.error("failed to process post", post.id, err);
     }
+
+    if (!nextCursor || posts.length === 0 || processed >= maxTotal) {
+      lastCursor = nextCursor;
+      break;
+    }
+
+    cursor = nextCursor;
+    lastCursor = nextCursor;
+    iterations += 1;
   }
 
-  return { eventsProcessed: processed, nextCursor, hasMore: Boolean(nextCursor) };
+  const hasMore = Boolean(lastCursor && processed < maxTotal);
+  return { eventsProcessed: processed, nextCursor: lastCursor, hasMore };
 }
 
-async function upsertFacebookPost(env: Env, post: FacebookPost, authorProfile: AuthorProfile | null): Promise<boolean> {
+async function upsertFacebookPost(
+  env: Env,
+  post: FacebookPost,
+  authorProfile: AuthorProfile | null,
+  isLifeEvent: boolean
+): Promise<boolean> {
   if (!post.id) {
     return false;
   }
@@ -331,6 +365,12 @@ async function upsertFacebookPost(env: Env, post: FacebookPost, authorProfile: A
       )
       .run();
     eventId = existing.id;
+
+    if (isLifeEvent) {
+      await env.EVENTS_DB.prepare("UPDATE events SET sync = 1 WHERE id = ?")
+        .bind(existing.id)
+        .run();
+    }
   } else {
     const { lastInsertRowid } = await env.EVENTS_DB.prepare(
       `INSERT INTO events (
@@ -343,7 +383,7 @@ async function upsertFacebookPost(env: Env, post: FacebookPost, authorProfile: A
         post.id,
         "facebook_post",
         structured.eventDate || post.created_time || now,
-        structured.eventType || "memory",
+        structured.eventType || post.status_type || "memory",
         line1,
         line2,
         fullText || null,
@@ -353,7 +393,7 @@ async function upsertFacebookPost(env: Env, post: FacebookPost, authorProfile: A
         1,
         0,
         "facebook",
-        1,
+        isLifeEvent ? 1 : 0,
         now,
         now
       )
@@ -369,7 +409,7 @@ async function upsertFacebookPost(env: Env, post: FacebookPost, authorProfile: A
     .all<EventPhotoRecord>();
   const existingBySource = new Map<string, EventPhotoRecord>();
   (existingPhotos || []).forEach((p) => {
-    if (p.original_source_url) existingBySource.set(p.original_source_url, p);
+    if (p.original_source_url) existingBySource.set(normalizeSourceUrl(p.original_source_url), p);
   });
 
   const photoUrls = extractPhotoUrls(post.attachments);
@@ -381,8 +421,9 @@ async function upsertFacebookPost(env: Env, post: FacebookPost, authorProfile: A
 
   for (const url of photoUrls) {
     if (!url) continue;
-    seenSources.add(url);
-    const existingPhoto = existingBySource.get(url);
+    const normalized = normalizeSourceUrl(url);
+    seenSources.add(normalized);
+    const existingPhoto = existingBySource.get(normalized);
     if (existingPhoto) {
       await env.EVENTS_DB.prepare(
         "UPDATE event_photos SET position = ?, updated_at = ? WHERE id = ?"
@@ -401,7 +442,7 @@ async function upsertFacebookPost(env: Env, post: FacebookPost, authorProfile: A
 
   // Remove orphaned rows whose source URLs are no longer present.
   for (const p of existingPhotos || []) {
-    if (p.original_source_url && !seenSources.has(p.original_source_url)) {
+    if (p.original_source_url && !seenSources.has(normalizeSourceUrl(p.original_source_url))) {
       await env.EVENTS_DB.prepare("DELETE FROM event_photos WHERE id = ?")
         .bind(p.id)
         .run();
@@ -596,6 +637,17 @@ async function fetchWebflowFieldMap(env: Env): Promise<Record<string, string>> {
   return map;
 }
 
+function normalizeSourceUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    u.search = "";
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
 async function fetchFacebookFeed(
   env: Env,
   opts?: { limit?: number; maxTotal?: number; cursor?: string; maxPages?: number }
@@ -652,6 +704,134 @@ async function fetchFacebookFeed(
   }
 
   return { posts: results.slice(0, maxTotal), nextCursor };
+}
+
+async function cleanDuplicates(env: Env): Promise<{
+  eventsRemoved: number;
+  photosRemoved: number;
+}> {
+  let eventsRemoved = 0;
+  let photosRemoved = 0;
+
+  // Remove duplicate events by external_source/external_id (keep smallest id)
+  const dupEvents = await env.EVENTS_DB.prepare(
+    `WITH ranked AS (
+       SELECT id, external_source, external_id,
+              ROW_NUMBER() OVER (PARTITION BY external_source, external_id ORDER BY id) AS rn
+       FROM events
+       WHERE external_source IS NOT NULL AND external_id IS NOT NULL
+     )
+     SELECT id FROM ranked WHERE rn > 1`
+  ).all<{ id: number }>();
+
+  if (dupEvents.results?.length) {
+    const ids = dupEvents.results.map((r) => r.id);
+    // Collect photo storage keys for these events to clean R2
+    const placeholders = ids.map(() => "?").join(", ");
+    const { results: photoRows } = await env.EVENTS_DB.prepare(
+      `SELECT storage_key FROM event_photos WHERE event_id IN (${placeholders})`
+    )
+      .bind(...ids)
+      .all<{ storage_key: string }>();
+
+    if (photoRows) {
+      for (const p of photoRows) {
+        if (p.storage_key) {
+          await env.EVENT_PHOTOS_BUCKET.delete(p.storage_key).catch(() => {});
+        }
+      }
+    }
+
+    await env.EVENTS_DB.prepare(
+      `DELETE FROM events WHERE id IN (${placeholders})`
+    )
+      .bind(...ids)
+      .run();
+    eventsRemoved += ids.length;
+  }
+
+  // Remove duplicate events by external_id alone (origin-limited), in case external_source differs/missing.
+  const dupByExternalId = await env.EVENTS_DB.prepare(
+    `WITH ranked AS (
+       SELECT id, external_id,
+              ROW_NUMBER() OVER (PARTITION BY external_id ORDER BY id) AS rn
+       FROM events
+       WHERE external_id IS NOT NULL AND origin = 'facebook'
+     )
+     SELECT id FROM ranked WHERE rn > 1`
+  ).all<{ id: number }>();
+
+  if (dupByExternalId.results?.length) {
+    const ids = dupByExternalId.results.map((r) => r.id);
+    const placeholders = ids.map(() => "?").join(", ");
+    const { results: photoRows } = await env.EVENTS_DB.prepare(
+      `SELECT storage_key FROM event_photos WHERE event_id IN (${placeholders})`
+    )
+      .bind(...ids)
+      .all<{ storage_key: string }>();
+
+    if (photoRows) {
+      for (const p of photoRows) {
+        if (p.storage_key) {
+          await env.EVENT_PHOTOS_BUCKET.delete(p.storage_key).catch(() => {});
+        }
+      }
+    }
+
+    await env.EVENTS_DB.prepare(
+      `DELETE FROM events WHERE id IN (${placeholders})`
+    )
+      .bind(...ids)
+      .run();
+    eventsRemoved += ids.length;
+  }
+
+  // Remove duplicate photos per event by original_source_url (keep smallest id)
+  const { results: allPhotos } = await env.EVENTS_DB.prepare(
+    "SELECT id, event_id, storage_key, original_source_url FROM event_photos"
+  ).all<EventPhotoRecord>();
+
+  if (allPhotos) {
+    const toDelete: { id: number; storage_key: string | null }[] = [];
+    const grouped = new Map<number, Map<string, EventPhotoRecord[]>>();
+
+    for (const p of allPhotos) {
+      const norm = p.original_source_url ? normalizeSourceUrl(p.original_source_url) : "";
+      const byEvent = grouped.get(p.event_id) || new Map<string, EventPhotoRecord[]>();
+      const arr = byEvent.get(norm) || [];
+      arr.push(p);
+      byEvent.set(norm, arr);
+      grouped.set(p.event_id, byEvent);
+    }
+
+    for (const [, byNorm] of grouped) {
+      for (const [, arr] of byNorm) {
+        if (arr.length > 1) {
+          // keep earliest id, delete rest
+          arr.sort((a, b) => a.id - b.id);
+          arr.slice(1).forEach((dup) => toDelete.push({ id: dup.id, storage_key: dup.storage_key }));
+        }
+      }
+    }
+
+    if (toDelete.length) {
+      const ids = toDelete.map((d) => d.id);
+      const placeholders = ids.map(() => "?").join(", ");
+
+      for (const d of toDelete) {
+        if (d.storage_key) {
+          await env.EVENT_PHOTOS_BUCKET.delete(d.storage_key).catch(() => {});
+        }
+      }
+
+      await env.EVENTS_DB.prepare(`DELETE FROM event_photos WHERE id IN (${placeholders})`)
+        .bind(...ids)
+        .run();
+      photosRemoved += ids.length;
+    }
+  }
+
+  return { eventsRemoved, photosRemoved };
 }
 
 async function persistPhotoFromUrl(
