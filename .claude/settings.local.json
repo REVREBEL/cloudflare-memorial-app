@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(jq:*)",
+      "Bash(npx wrangler tail:*)",
+      "Bash(npx wrangler deploy)",
+      "Bash(npx wrangler d1 execute:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

@@ -21,6 +21,9 @@ export interface Env {
 
   // Optional shared secret for webhook trigger
   WEBHOOK_SECRET?: string;
+
+  // Optional worker URL for scheduled tasks and chaining (e.g., https://timeline-events-worker.rebel-camp.workers.dev)
+  WORKER_URL?: string;
 }
 
 type EventRecord = {
@@ -86,6 +89,9 @@ export default {
     try {
       const url = new URL(request.url);
 
+      // Log all incoming requests for debugging
+      console.log(`[Request] ${request.method} ${url.pathname}${url.search ? url.search : ""}`);
+
       if (url.pathname.startsWith("/photos/")) {
         return await servePhoto(url.pathname.replace("/photos/", ""), env);
       }
@@ -120,8 +126,14 @@ export default {
           return new Response("unauthorized", { status: 401 });
         }
         if (request.method === "POST") {
+          // Log all webhook POST requests for debugging
+          const bodyText = await request.text();
+          console.log(`[Webhook] Received POST from Facebook. Body length: ${bodyText.length}`);
+          console.log(`[Webhook] Body preview: ${bodyText.substring(0, 200)}`);
+
           const token = url.searchParams.get("token") || url.searchParams.get("verify_token");
           if (expected && token !== expected) {
+            console.log(`[Webhook] Rejected: token mismatch`);
             return new Response("unauthorized", { status: 401 });
           }
           // Use waitUntil to allow the sync (and any chained calls) to complete in the background
@@ -150,7 +162,10 @@ export default {
 
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
     await cleanDuplicates(env);
-    await syncFromFacebookToD1(env, _ctx, new URL("https://scheduled.run"), { shouldChain: true });
+    // Construct proper URL for chaining - use WORKER_URL if available, otherwise use PUBLIC_BASE_URL
+    const baseUrl = env.WORKER_URL || env.PUBLIC_BASE_URL || "https://timeline-events-worker.rebel-camp.workers.dev";
+    const syncUrl = new URL("/api/sync/facebook", baseUrl);
+    await syncFromFacebookToD1(env, _ctx, syncUrl, { shouldChain: true });
     await syncFromD1ToWebflow(env);
     // Future:
     // await syncFromD1ToFacebook(env);
@@ -294,22 +309,44 @@ async function syncFromFacebookToD1(
   let lastCursor: string | undefined;
   let inserted = 0;
   let updated = 0;
+  let previousCursor: string | undefined;
+  const seenPostIds = new Set<string>(); // Track posts we've already seen in this sync
 
   // Continue fetching until we've processed enough posts WITH content, not just any posts
   while (processed < maxTotal && iterations < 20) {
+    console.log(`[Fetch] Iteration ${iterations + 1}, fetching with cursor: ${cursor ? cursor.substring(0, 30) + "..." : "none"}`);
     const { posts, nextCursor } = await fetchFacebookFeed(env, {
       limit,
       cursor,
     });
 
+    console.log(`[Fetch] Got ${posts.length} posts from Facebook, nextCursor: ${nextCursor ? nextCursor.substring(0, 30) + "..." : "none"}`);
+
     if (posts.length === 0) {
+      console.log(`[Fetch] No posts returned, stopping.`);
+      break;
+    }
+
+    // If the cursor hasn't changed, we've hit the end of available data
+    if (nextCursor && previousCursor && nextCursor === previousCursor) {
+      console.log(`[Fetch] Cursor hasn't changed, reached end of available posts.`);
+      lastCursor = undefined; // Clear cursor so we don't chain
       break;
     }
 
     for (const post of posts) {
       // Only process items that are actual posts (have a message or story).
       // This filters out noise like likes, comments, etc. from the feed.
-      if (!post.message && !post.story) {
+      // Also include life events which may only have attachment data.
+      const hasContent = post.message || post.story || hasLifeEventAttachment(post) || post.attachments?.data?.length;
+      if (!hasContent) {
+        console.log(`[Skip] Post ${post.id} has no content (no message/story/attachments)`);
+        continue;
+      }
+
+      // Skip if we've already seen this post in this sync run
+      if (post.id && seenPostIds.has(post.id)) {
+        console.log(`[Skip] Already processed post ${post.id} in this sync`);
         continue;
       }
 
@@ -323,6 +360,9 @@ async function syncFromFacebookToD1(
         const result = await upsertFacebookPost(env, post, authorProfile, isLifeEvent);
         if (result.processed) {
           processed += 1;
+          if (post.id) seenPostIds.add(post.id); // Track this post
+          const action = result.inserted ? "inserted" : result.updated ? "updated" : "processed";
+          console.log(`[Post ${processed}/${maxTotal}] ${action} post ${post.id}`);
           if (result.inserted) inserted += 1;
           if (result.updated) updated += 1;
         }
@@ -341,20 +381,31 @@ async function syncFromFacebookToD1(
       break;
     }
 
+    previousCursor = cursor; // Track previous cursor to detect when we've hit the end
     cursor = nextCursor;
     iterations += 1;
   }
 
-  // Determine if Facebook has more data - only if we hit our processing limit AND have a cursor
-  const hasMore = processed >= maxTotal && Boolean(lastCursor);
+  // Determine if Facebook has more data:
+  // - only if we still have a cursor, and
+  // - either we hit our processing limit OR we hit the safety iterations cap.
+  const hasMore = Boolean(lastCursor) && (processed >= maxTotal || iterations >= 20);
   const summary = { eventsProcessed: processed, inserted, updated, nextCursor: lastCursor, hasMore };
 
+<<<<<<< Updated upstream
+=======
+  console.log(
+    `[Facebook Sync] Batch results: Processed=${processed}/${maxTotal}, Inserted=${inserted}, Updated=${updated}, Iterations=${iterations}, HasMore=${hasMore}, HitIterationCap=${iterations >= 20}`
+  );
+
+>>>>>>> Stashed changes
   // If there's more data and chaining is enabled, trigger the next batch.
   if (hasMore && opts?.shouldChain && lastCursor) {
     console.log(
       `Sync batch complete. Processed: ${summary.eventsProcessed}, Inserted: ${summary.inserted}, Updated: ${summary.updated}. Chaining to next batch...`
     );
 
+<<<<<<< Updated upstream
     const nextUrl = new URL(requestUrl.pathname, requestUrl.origin);
     // Preserve the 'chain' and 'token' parameters for the next request.
     if (opts.shouldChain) nextUrl.searchParams.set("chain", "true");
@@ -363,6 +414,32 @@ async function syncFromFacebookToD1(
 
     // Use waitUntil to fire-and-forget the next chained request.
     ctx.waitUntil(fetch(nextUrl.toString(), { method: "POST" }));
+=======
+    // Instead of using fetch (which can't call the same worker), recursively call this function
+    // with waitUntil to continue processing in the background
+    ctx.waitUntil(
+      (async () => {
+        try {
+          console.log(`[Chain] Starting next batch with cursor: ${lastCursor.substring(0, 30)}...`);
+          const nextSummary = await syncFromFacebookToD1(env, ctx, requestUrl, {
+            maxTotal: opts.maxTotal,
+            limit: opts.limit,
+            cursor: lastCursor,
+            shouldChain: true,
+          });
+          console.log(
+            `[Chain] Next batch complete: Processed=${nextSummary.eventsProcessed}, Inserted=${nextSummary.inserted}, Updated=${nextSummary.updated}`
+          );
+        } catch (err) {
+          console.error(`[Chain] Failed:`, err);
+        }
+      })()
+    );
+  } else {
+    console.log(
+      `Sync complete. No chaining: hasMore=${hasMore}, shouldChain=${opts?.shouldChain}, hasCursor=${Boolean(lastCursor)}`
+    );
+>>>>>>> Stashed changes
   }
 
   return summary;
@@ -408,6 +485,8 @@ async function upsertFacebookPost(
   )
     .bind(post.id)
     .first<{ id: number }>();
+
+  console.log(`[DB Check] Post ${post.id} - ${existing?.id ? `Found existing event ${existing.id}` : 'Not found, will insert'}`);
 
   const now = new Date().toISOString();
   let eventId: number;
@@ -736,13 +815,14 @@ async function fetchFacebookFeed(
     "attachments{description,title,type,description_tags,media_type,media{image{src},source},subattachments{description,title,type,media{image{src},source}}}",
   ].join(",");
 
-  const api = new URL(`https://graph.facebook.com/v24.0/${env.FB_PAGE_ID}/feed`);
-  api.searchParams.set("fields", baseFields);
-  api.searchParams.set("access_token", env.FB_PAGE_ACCESS_TOKEN);
-  api.searchParams.set("limit", String(limit));
-  if (after) api.searchParams.set("after", after);
+  // Try published_posts endpoint to get all published content including backdated life events
+  const feedApi = new URL(`https://graph.facebook.com/v24.0/${env.FB_PAGE_ID}/published_posts`);
+  feedApi.searchParams.set("fields", baseFields);
+  feedApi.searchParams.set("access_token", env.FB_PAGE_ACCESS_TOKEN);
+  feedApi.searchParams.set("limit", String(limit));
+  if (after) feedApi.searchParams.set("after", after);
 
-  const res = await fetch(api.toString());
+  const res = await fetch(feedApi.toString());
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`Facebook API error ${res.status}: ${text}`);
@@ -751,6 +831,8 @@ async function fetchFacebookFeed(
   const json = (await res.json()) as { data?: FacebookPost[]; paging?: { cursors?: { after?: string } } };
   const posts = json.data || [];
   const nextCursor = json.paging?.cursors?.after;
+
+  console.log(`[Fetch Debug] Published_posts endpoint returned ${posts.length} posts, cursor: ${nextCursor ? 'present' : 'none'}`);
 
   return { posts, nextCursor };
 }
